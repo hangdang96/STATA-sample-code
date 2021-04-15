@@ -1,0 +1,279 @@
+  clear
+  set memory 100m
+  set more off
+  
+  /// Create global dofile path
+  global file_path = "C:\Users\Hang\stata_code_data"
+  cd "$file_path\do_file
+
+	****** DATA PREPARATION (MATCHING AND MERGING) *****
+	/// 1. Match all manufacturing data over time from 1998 to 2007 ////
+  orvalues i = 1998/2007 {
+	/// change directory to `i' year subfolder, remember when cd contain a macro local it should be forward slash "/", NOT back slash "\"
+    	cd ./`i'    
+	/// create a local with all txt file names
+	local alltxt : dir "." file "*.txt"
+	/// save all txt files in dta format
+	foreach file in `alltxt' {
+		insheet using `file',clear
+		save `file'.dta, replace
+		}
+	
+	/// append all dta files in `i' year
+	clear
+	local alldta: dir "." file "*.dta"
+	foreach file in `alldta' {
+		append using `file', force
+		}
+		
+	/// generate Year variable and save appended year `i' file in data_input folder
+	gen Year = `i'
+	save ../`i'.dta, replace
+	
+	/// remove all single files within year `i'
+	local alldta: dir "." file "*.dta"
+	foreach file in `alldta' { 
+		rm `file'
+		} 
+
+      /// move back to data_input folder
+      cd ..
+    }
+    /// append all seperate year dta in a single file
+    clear
+    forval i = 1998/2007 {      
+     append using `i'.dta, force
+     }
+     save 1998_2007.dta, replace
+    forval i = 1998/2007 { 
+     rm `i'.dta
+     }
+
+    //// 2. Translate city name and province name ////    
+    tempfile province_en city_en
+    preserve
+
+  import excel city_translation.xls, sheet("Province") firstrow clear
+  save `province_en', replace
+
+  import excel city_translation.xls, sheet("City") firstrow clear
+  drop if district_city_county_name==""
+  save `city_en', replace 
+
+restore
+
+// Translate Province name into English using merge 
+
+merge m:1 province_name using `province_en', generate(_mergepro) 
+
+merge m:1 province_name district_city_county_name using `city_en', generate(_mergecity)
+
+drop _m*
+
+*** Note 1,584 obs in manufacturing file have missing data on city
+
+////////// Merge deflator data files ///////////
+preserve
+
+use 2_digit_input_deflator.dta, clear
+reshape long InputDefl, i(cic_adj) j(Year)
+tostring cic_adj, replace
+save InputDefl_long.dta, replace
+
+use 2_digit_output_deflator.dta, clear
+reshape long OutputDefl, i(cic_adj) j(Year)
+save OutputDefl_long.dta, replace
+
+restore
+
+* Merge with manufacturing data *
+local var sector_code_four_digits sector_code_three_digits sector_code_two_digits
+local str_var cic_adj cic3 cic2
+tostring `var',generate(`str_var')
+
+//// Merge input data ////
+
+local io "InputDefl OutputDefl" 
+
+foreach defl in `io' {
+
+merge m:1 cic_adj Year using `defl'_long.dta, gen(_m4)
+drop if _m4 == 2
+
+tempfile `defl'_3_digit
+preserve
+use `defl'_long.dta, clear
+gen cic3 = substr(cic_adj,1,3)
+bysort cic3 Year : egen `defl'_3_digit = mean(`defl')
+bysort cic3 Year : keep if _n ==1
+save ``defl'_3_digit', replace
+restore
+
+merge m:1 cic3 Year using ``defl'_3_digit', gen(_m3)
+drop if _m3 == 2
+replace `defl' = `defl'_3_digit if _m4 == 1
+
+//// Merge at 2 digits
+tempfile `defl'_2_digit
+preserve
+use `defl'_long.dta, clear
+gen cic2 = substr(cic_adj,1,2)
+bysort cic2 Year : egen `defl'_2_digit = mean(`defl')
+bysort cic2 Year : keep if _n ==1
+save ``defl'_2_digit', replace
+restore
+
+merge m:1 cic2 Year using ``defl'_2_digit', gen(_m2)
+drop if _m2 == 2
+replace `defl' = `defl'_2_digit if _m3 == 1
+
+drop _m* `defl'_*
+rm `defl'_long.dta 
+
+}
+
+rename cic_adj cic4
+
+***** CREATE VARIABLES FOR TFP ESTIMATION ***
+gen output: "Industrial output value (price of that year)" = Industrial_output_value_inyear
+gen l: "total employee number - annual average" = total_emp_annual_average
+gen k_price: "fixed asset original price" = fixed_asset_total_originalprice
+gen mat: "intermediate input" = intermediate_input
+gen value_added: "industrial_added_value" = industrial_added_value
+
+//because the current label is in Chinese
+label var accumulated_depreciation "accumulated depreciation"
+
+
+// current co_code is string, creat new numeric id for co_code
+egen co_code = group(The_only_firm_code)	
+
+
+//// destring cic industry code to numeric
+
+forval i=2/4 {
+destring cic`i', replace
+
+}
+
+/// Clean data ///
+
+local varlist output l k_price mat accumulated_depreciation value_added
+//investigate missing value and negative value
+foreach var in `varlist' {
+sum `var', 
+count if `var' == .
+count if `var' < 0
+count if `var' == 0
+//tab year, sum (`var')
+}
+
+/// remove negative values
+foreach var in k_price mat accumulated_depreciation {
+drop if `var' < 0
+count if `var' < 0
+}
+
+//// Create variables ////
+/// sales output
+ tsset co_code year
+/// with imputed missing data
+
+gen outputdfl = (output/OutputDefl)*100 
+gen logoutput = log(1+output)
+gen logoutputdfl = log(1+outputdfl)
+
+/// value added
+
+gen valuedfl = (value_added/OutputDefl)*100 
+gen logvalue = log(1+value_added)
+gen logvaluedfl = log(1+valuedfl)
+	
+
+	
+// capital
+	
+gen k_price_adj = k_price - accumulated_depreciation   ///fixed assets adjusted for depreciation, we're using total fixed assets, there are also fixed assets in original price (which might be more suitable?)
+
+gen kdfl = (k_price_adj/BR_deflator)*100 
+gen logk = log(1+k_price_adj)
+gen logkdfl = log(1+kdfl)
+	
+	
+// labour 
+	
+gen logl = log(1+l)
+gen logldfl = logl //Using the term ldfl only because a lot of the rest of the code uses legacy name logldfl
+	
+// materials
+gen matdfl = (mat/InputDefl)*100 // This line is where the 'deflation' happens
+gen logmat = log(1+mat)
+gen logmatdfl = log(1+matdfl)
+
+// Create foreign dummy - based on Javorcik (2004)
+// gen invest_capital = national_capital + collective_capital + legal_representative_capital + personal_capital + HK_Macao_Taiwan_capital + foreign_investment_capital
+// this is equal to paid-in capital
+
+drop if foreign_investment_capital < 0
+gen foreign_share = foreign_investment_capital/among_paid_in_capital
+gen fordum = 0
+replace fordum = 1 if foreign_share >= 0.1  ///235k obs are foreign firms
+
+//// Because value added ACF estimation has an unusually large tfp growth rate in 2003, we suspect that this is because of the imputed data, so we re-estimate the tfp without imputed data ////
+gen value_added_m: "industrial_added_value with missing data" = industrial_added_value
+gen output_m: "Industrial output value (price of that year) with missing data" = Industrial_output_value_inyear
+
+gen valuedfl_m = (value_added_m/OutputDefl)*100 
+gen logvaluedfl_m = log(1+valuedfl_m)
+
+gen outputdfl_m = (output_m/OutputDefl)*100 
+gen logoutputdfl_m = log(1+outputdfl_m)
+
+
+**** ESTIMATE TFP OF MANUFACTURING FIRMS ****
+set seed 1234
+
+// create a temporary folder for use later
+cap mkdir tfp_lp_cic4
+cd tfp_lp_cic4
+
+	preserve
+	clear
+	cap: erase productivity_lp.dta
+	save productivity_lp.dta, emptyok
+	restore
+	tsset co_code year
+display "$S_TIME  $S_DATE"
+
+levelsof cic4, local(cic4)
+	foreach cic of local cic4{
+		preserve
+		keep if cic4==`cic'
+		di "`cic'"
+		cap noisily prodest logoutputdfl, free(logldfl) proxy(logmatdfl) state(logkdfl) method(lp) reps(250) id(co_code) t(year) fsresiduals(tfp_cic4_allfirms_stage1)
+		predict tfp_cic4_allfirms_lp if e(sample), omega // if e(sample) to avoid predictions for missing log prod
+		cap label var tfp_cic4_allfirms_lp "TFP estimates using output at cic4 and all firms LP method"
+		append using productivity_lp.dta
+		save productivity_lp.dta, replace
+		restore
+		
+		
+		}
+
+	foreach cic of local cic4{
+		preserve
+		keep if cic4==`cic' & !fordum
+		di "`cic'"
+		cap noisily prodest logoutputdfl, free(logldfl) proxy(logmatdfl) state(logkdfl) method(lp) reps(250) id(co_code) t(year) fsresiduals(tfp_cic4_notfordum_stage1)
+		cap predict tfp_cic4_notfordum_lp if e(sample), omega // if e(sample) to avoid predictions for missing log prod
+		cap label var tfp_cic4_notfordum_lp "TFP estimates using output at cic4 and domestic firms LP method"
+		append using productivity_lp.dta
+		collapse (min)tfp*, by (co_code year)		
+		save productivity_lp.dta, replace
+		restore
+		
+		
+		}
+
+display "$S_TIME  $S_DATE"		
+
