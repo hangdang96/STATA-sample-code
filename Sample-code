@@ -6,9 +6,10 @@
   global file_path = "C:\Users\Hang\stata_code_data"
   cd "$file_path\do_file
 
+	****************************************************
 	****** DATA PREPARATION (MATCHING AND MERGING) *****
 	/// 1. Match all manufacturing data over time from 1998 to 2007 ////
-  orvalues i = 1998/2007 {
+        forvalues i = 1998/2007 {
 	/// change directory to `i' year subfolder, remember when cd contain a macro local it should be forward slash "/", NOT back slash "\"
     	cd ./`i'    
 	/// create a local with all txt file names
@@ -41,20 +42,19 @@
     }
     /// append all seperate year dta in a single file
     clear
-    forval i = 1998/2007 {      
+    forvalues i=1998/2007 {
      append using `i'.dta, force
      }
      save 1998_2007.dta, replace
-    forval i = 1998/2007 { 
+     forvalues i = 1998/2007 {
      rm `i'.dta
      }
 
     //// 2. Translate city name and province name ////    
     tempfile province_en city_en
     preserve
-
-  import excel city_translation.xls, sheet("Province") firstrow clear
-  save `province_en', replace
+	import excel city_translation.xls, sheet("Province") firstrow clear		
+	  save `province_en', replace
 
   import excel city_translation.xls, sheet("City") firstrow clear
   drop if district_city_county_name==""
@@ -134,6 +134,7 @@ rm `defl'_long.dta
 
 rename cic_adj cic4
 
+*********************************************
 ***** CREATE VARIABLES FOR TFP ESTIMATION ***
 gen output: "Industrial output value (price of that year)" = Industrial_output_value_inyear
 gen l: "total employee number - annual average" = total_emp_annual_average
@@ -151,7 +152,7 @@ egen co_code = group(The_only_firm_code)
 
 //// destring cic industry code to numeric
 
-forval i=2/4 {
+forvalues i = 2/4 {
 destring cic`i', replace
 
 }
@@ -189,19 +190,14 @@ gen valuedfl = (value_added/OutputDefl)*100
 gen logvalue = log(1+value_added)
 gen logvaluedfl = log(1+valuedfl)
 	
-
-	
 // capital
 	
-gen k_price_adj = k_price - accumulated_depreciation   ///fixed assets adjusted for depreciation, we're using total fixed assets, there are also fixed assets in original price (which might be more suitable?)
-
+gen k_price_adj = k_price - accumulated_depreciation   
 gen kdfl = (k_price_adj/BR_deflator)*100 
 gen logk = log(1+k_price_adj)
 gen logkdfl = log(1+kdfl)
 	
-	
 // labour 
-	
 gen logl = log(1+l)
 gen logldfl = logl //Using the term ldfl only because a lot of the rest of the code uses legacy name logldfl
 	
@@ -219,17 +215,7 @@ gen foreign_share = foreign_investment_capital/among_paid_in_capital
 gen fordum = 0
 replace fordum = 1 if foreign_share >= 0.1  ///235k obs are foreign firms
 
-//// Because value added ACF estimation has an unusually large tfp growth rate in 2003, we suspect that this is because of the imputed data, so we re-estimate the tfp without imputed data ////
-gen value_added_m: "industrial_added_value with missing data" = industrial_added_value
-gen output_m: "Industrial output value (price of that year) with missing data" = Industrial_output_value_inyear
-
-gen valuedfl_m = (value_added_m/OutputDefl)*100 
-gen logvaluedfl_m = log(1+valuedfl_m)
-
-gen outputdfl_m = (output_m/OutputDefl)*100 
-gen logoutputdfl_m = log(1+outputdfl_m)
-
-
+*********************************************
 **** ESTIMATE TFP OF MANUFACTURING FIRMS ****
 set seed 1234
 
@@ -255,9 +241,7 @@ levelsof cic4, local(cic4)
 		cap label var tfp_cic4_allfirms_lp "TFP estimates using output at cic4 and all firms LP method"
 		append using productivity_lp.dta
 		save productivity_lp.dta, replace
-		restore
-		
-		
+		restore	
 		}
 
 	foreach cic of local cic4{
@@ -270,10 +254,71 @@ levelsof cic4, local(cic4)
 		append using productivity_lp.dta
 		collapse (min)tfp*, by (co_code year)		
 		save productivity_lp.dta, replace
-		restore
-		
-		
+		restore				
 		}
 
 display "$S_TIME  $S_DATE"		
+
+	//// Merge tfp estimation with manufacturing data
+	preserve 
+	tempfile lp
+	cd .\tfp_lp_cic4
+	use productivity_lp.dta, clear
+	keep co_code year tfp*
+	save `lp', replace
+	restore
+	merge 1:1 co_code year using `lp', gen(_mlp)   
+	//// all merged /////
+	drop _m* tfp_cic4_notfordum_stage1 tfp_cic4_allfirms_stage1
+	cd ..
+
+********************************************************************
+************* MERGE AND CREATE INSTRUMENTAL VARIABLES **************
+
+/// Match CIC with ISIC
+preserve
+
+use isic3_ussic_raw_from_un_01.dta, clear
+reshape long sic, i(isic) j(sic87)
+drop if sic == .
+
+bysort isic sic: gen pair = _N   //check that each isic and sic pair is unique
+replace pair = _n
+
+forval i = 1958/2011 {
+gen fyear`i' = .
+}
+
+reshape long fyear, i(pair) j(year)
+drop fyear sic87 pair
+sort isic sic year
+
+merge m:1 sic year using sic5811.dta  // all match 
+drop _m 
+
+/// clean up 
+drop if year < 1998 | year > 2007      
+drop if tfp5 == .
+
+/// Generate vars for merging
+gen wagerate = prodw/prodh
+gen energy_vship = energy/vship
+gen mat_vship = matcost/vship
+gen energy_invent = energy/invent
+gen mat_invent = matcost/invent
+
+local mvarlist wagerate energy_vship mat_vship energy_invent mat_invent
+local wm tfp5 tfp4 dtfp5 dtfp4
+
+foreach mvar in `mvarlist'  {
+bysort isic year: egen m_`mvar' = mean(`mvar')
+}
+
+bysort isic year: egen tot_vadd = sum(vadd)
+foreach tfp in `wm' {
+bysort isic year: egen sigma_w`tfp' = sum(`tfp'*vadd)
+gen wm_`tfp' = sigma_w`tfp'/tot_vadd
+drop sigma_w`tfp'
+}
+
 
